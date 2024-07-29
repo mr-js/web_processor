@@ -38,6 +38,9 @@ class WebProcessor:
 
 
     async def detect_protect(self, content):
+        return 'recaptcha v3'
+    
+
         if 'https://challenges.cloudflare.com/turnstile' in content:
             if 'challenge-success-text' in content:
                 return 'cloudflare challenges'
@@ -53,19 +56,30 @@ class WebProcessor:
     async def protect_break(self, data):
         async with aiohttp.ClientSession() as session:
             solution = dict()
-            async with session.post("https://2captcha.com/in.php", data=data) as response:
+            data["clientKey"] = self.my_key
+            if self.proxy:
+                data["task"]["proxyType"] = self.proxy.split('://')[0]
+                data["task"]["proxyAddress"] = self.proxy.split('://')[1].split(':')[0]
+                data["task"]["proxyPort"] = self.proxy.split('://')[1].split(':')[1]
+                # data["task"]["proxyLogin"]
+                # data["task"]["proxyPassword"]
+            else:
+                data["task"]["type"] += 'Proxyless'
+            print(data)
+            async with session.post("https://api.2captcha.com/createTask", json=data) as response:
                 response_text = await response.text()
                 print("Request sent", response_text)
                 response_json = await response.json()
-                s = response_json["request"]
+            data["taskId"] = response_json.get("taskId")
             while True:
-                async with session.get(f"https://2captcha.com/res.php?key={self.my_key}&action=get&json=1&id={s}") as solution_response:
+                async with session.post(f"https://api.2captcha.com/getTaskResult", json=data) as solution_response:
                     solution = await solution_response.json()
-                    if solution["request"] == "CAPCHA_NOT_READY":
-                        print(solution["request"])
+                    print(f'{solution=}')
+                    if solution["status"] == "processing":
+                        print('Processing...')
                         await asyncio.sleep(8)
-                    elif "ERROR" in solution["request"]:
-                        print(solution["request"])
+                    elif solution["errorId"] != 0:
+                        print(solution)
                         break
                     else:
                         break
@@ -125,19 +139,22 @@ class WebProcessor:
                 # await page.evaluate("console.log('TEST MSG')")
                 await page.wait_for_timeout(10000)
                 data = {
-                    "key": self.my_key,
-                    "method": "turnstile",
-                    "sitekey": params["sitekey"],
-                    "action": params["action"],
-                    "data": params["data"],
-                    "pagedata": params["pagedata"],
-                    "useragent": params["userAgent"],
-                    "json": 1,
-                    "pageurl": params["pageurl"],
+                    "clientKey": self.my_key,
+                    "task": {
+                        "type": "TurnstileTask",
+                        "websiteURL": url,
+                        "websiteKey": params["sitekey"],
+                        "action": "managed",
+                        "data": params["data"],
+                        "pagedata": params["pagedata"],
+                        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    }
                 }
+                print(data)
                 solution = await self.protect_break(data)
-                if solution:
-                    await page.evaluate(f"cfCallback('{solution['''request''']}');")
+                if solution.get("errorId", -1) == 0:
+                    token = solution['solution']['token']
+                    await page.evaluate(f"cfCallback('{token}');")
                     await page.wait_for_timeout(5000)
                 else:             
                     await page.close()
@@ -153,17 +170,20 @@ class WebProcessor:
                         return cloudflareElement ? cloudflareElement.getAttribute('data-sitekey') : null;
                     }''')                
                 data = {
-                    "key": self.my_key,
-                    "method": "turnstile",
-                    "sitekey": sitekey,
-                    "json": 1,
-                    "pageurl": url,
-                }
+                    "clientKey": self.my_key,
+                    "task": {
+                        "type": "TurnstileTask",
+                        "websiteURL": url,
+                        "websiteKey": sitekey,
+                        #  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                    }
+                }            
                 solution = await self.protect_break(data)
-                if solution:
-                    await page.evaluate("""async (solution) => {
-                        document.querySelector('[name="cf-turnstile-response"]').value = solution['request'];
-                    }""", solution)
+                if solution.get("errorId", -1) == 0:
+                    token = solution['solution']['token']
+                    await page.evaluate("""async (token) => {
+                        document.querySelector('[name="cf-turnstile-response"]').value = token;
+                    }""", token)
                     await page.wait_for_timeout(2000)
                     await page.click('button[type="submit"]')
                     await page.wait_for_timeout(4000)
@@ -178,27 +198,22 @@ class WebProcessor:
                     const recaptchaElement = document.querySelector('.g-recaptcha');
                     return recaptchaElement ? recaptchaElement.getAttribute('data-sitekey') : null;
                 }''')
-                if sitekey:
-                    print(f"Sitekey: {sitekey}")
-                else:
-                    print("Recaptcha element not found")
                 await page.wait_for_timeout(5000)
                 data = {
-                    "key": self.my_key,
-                    "method": "userrecaptcha",
-                    "googlekey": sitekey,
-                    "invisible": 0,
-                    "enterprise": 0,
-                    "version": "v2",
-                    "pageurl": url,
-                    "json": 1
-                }              
+                    "clientKey": self.my_key,
+                    "task": {
+                        "type": "RecaptchaV2Task",
+                        "websiteURL": url,
+                        "websiteKey": sitekey,
+                    }
+                }          
                 solution = await self.protect_break(data)
-                if solution:
+                if solution.get("errorId", -1) == 0:
+                    token = solution['solution']['gRecaptchaResponse']
                     await page.evaluate('''(token) => {
                         const textarea = document.getElementById('g-recaptcha-response');
                         textarea.value = token;
-                    }''', solution['request'])
+                    }''', token)
                     await page.wait_for_timeout(2000)
                     await page.click('button[type="submit"]')
                     await page.wait_for_timeout(4000)
@@ -206,6 +221,43 @@ class WebProcessor:
                     await page.close()
                     await context.close()
                     return ''
+                
+            case 'recaptcha v3':
+                params = dict()
+                # Intercept requests to the reCAPTCHA API script
+                async def intercept_request(request):
+                    nonlocal params
+                    if 'recaptcha/api.js' in request.url:
+                        sitekey = request.url.split(r'?render=')[1]
+                        print('Intercepted sitekey:', sitekey)
+                        params['sitekey'] = sitekey
+
+                page.on('request', intercept_request)                
+                await page.reload()
+                await page.wait_for_timeout(5000)
+                data = {
+                    "clientKey": self.my_key,
+                    "task": {
+                        "type": "RecaptchaV3Task",
+                        "websiteURL": url,
+                        "websiteKey": params['sitekey'],                      
+                        "minScore": 0.3,
+                    }
+                }          
+                solution = await self.protect_break(data)
+                if solution.get("errorId", -1) == 0:
+                    token = solution['solution']['gRecaptchaResponse']
+                    await page.evaluate('''(token) => {
+                        window.verifyRecaptcha(token);
+                    }''', token)
+                    await page.wait_for_timeout(4000)
+                    # await page.click('button[type="submit"]')
+                    # await page.wait_for_timeout(4000)
+                else:
+                    await page.close()
+                    await context.close()
+                    return ''
+
             case _:
                 ...   
 
@@ -221,13 +273,13 @@ async def main():
     urls = [
         # 'https://2captcha.com/demo/cloudflare-turnstile-challenge',
         # 'https://2captcha.com/demo/cloudflare-turnstile',
-        'https://2captcha.com/demo/recaptcha-v2',
-        # 'https://2captcha.com/demo/recaptcha-v3',
+        # 'https://2captcha.com/demo/recaptcha-v2',
+        'https://2captcha.com/demo/recaptcha-v3',
         # 'https://4pda.to/',
         # 'https://ipinfo.io/'
     ]
     
-    wp = WebProcessor()
+    wp = WebProcessor(proxy='')
     page_contents = await wp.fetch_pages(urls)
 
     for content in page_contents:
